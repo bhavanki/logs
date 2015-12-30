@@ -1,0 +1,216 @@
+#!/usr/bin/env bash
+
+# logs - write and roll logs
+# based in part on savelog in debianutils
+#
+# This script writes out standard input to a specified log file, but also
+# handles rolling over old copies of the log file each time it is run. Use it
+# instead of redirecting to a log file; instead of:
+#
+# <command> > output.log
+#
+# do this:
+#
+# <command> | logs output.log
+#
+# This script runs as long as standard input can be read, so when the feeding
+# command exits, it does too.
+#
+# When this script starts, it renames old logs, keeping up to a maximum number
+# (default 10) around, with the oldest having the highest number in its name.
+# The sequence is:
+#
+# output.log -> output.log.0.gz -> output.log.1.gz -> ... -> output.log.n-1.gz
+#
+# By default, old logs are compressed using gzip, but different compression or
+# none at all may be employed.
+#
+# Limitations:
+# - If a new log directory is chosen between runs, log rotation starts over.
+#   Logs in the old log directory are left alone.
+# - If the maximum count is reduced between runs, old logs with numbering
+#   greater than one less than the new maximum count are not removed.
+# - The compression tool must be able to take in the file to compress as its
+#   sole argument, and compress it in place. gzip, bzip2, xz, and compress
+#   all qualify.
+# - The user, group, and mode of old log files are never changed.
+
+# The MIT License (MIT)
+#
+# Copyright (c) 2016 Bill Havanki
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+usage() {
+  cat << EOF
+usage: $0 [options] <log>
+
+OPTIONS:
+  -c <count>   Maximum count of rolled logs, default 10
+  -d <dir>     Directory for logs instead of current directory
+  -g <group>   Group for new log file instead of shell default
+  -m <mode>    Mode for new log file instead of shell default
+  -u <user>    User for new log file instead of shell default
+  -v           Be verbose about log handling
+  -z <tool>    Tool for compressing rotated logs, default "gzip"
+  -Z           Do not compress rotated logs
+  -h           Shows this help message
+
+Log directory can be specified as part of <log> instead of using -d.
+
+EXAMPLES:
+
+  # Log to ./my.log, keep last 10 logs as my.log.0.gz through my.log.9.gz
+  <command> | logs my.log
+
+  # Log to /my/log/dir/my.log, keep last 10 logs as my.log.0.xz ...
+  <command> | logs -d /my/log/dir -z xz my.log
+
+  # Log to ./my.log, chmod to 600, keep last 20 logs with no compression
+  <command> | logs -c 20 -m 600 -Z my.log
+EOF
+}
+
+compress=gzip
+maxcount=10
+
+while getopts "c:d:g:m:u:vz:Zh" opt
+do
+  case $opt in
+    h)
+      usage
+      exit 0
+      ;;
+    c)
+      maxcount="$OPTARG"
+      ;;
+    d)
+      dir="$OPTARG"
+      ;;
+    g)
+      group="$OPTARG"
+      ;;
+    m)
+      mode="$OPTARG"
+      ;;
+    u)
+      user="$OPTARG"
+      ;;
+    v)
+      verbose="true"
+      ;;
+    z)
+      compress="$OPTARG"
+      ;;
+    Z)
+      compress=
+      ;;
+    ?)
+      usage
+      exit 1
+      ;;
+  esac
+done
+shift $((OPTIND - 1))
+
+debug() {
+  [[ -n $verbose ]] && echo "$*"
+}
+
+if [[ -n $compress ]] && ! hash "$compress"; then
+  echo "Cannot find compression tool $compress"
+  usage
+  exit 1
+fi
+
+LOG="$1"
+if [[ -z $LOG ]]; then
+  echo "Log name missing"
+  usage
+  exit 1
+fi
+
+# Determine the log directory and create it if necessary
+if [[ -n $dir ]]; then
+  LOG_DIR="$dir"
+else
+  LOG_DIR=$(dirname -- "$LOG")
+  if [[ -z $LOG_DIR ]]; then
+    LOG_DIR="."
+  fi
+fi
+
+if [[ ! -d $LOG_DIR ]]; then
+  debug "Creating $LOG_DIR"
+  mkdir -p -- "$LOG_DIR"
+fi
+debug "Logging to $LOG_DIR"
+
+# LOG = LOG_DIR/LOG_NAME
+LOG_NAME=$(basename "$LOG")
+LOG="$LOG_DIR/$LOG_NAME"
+
+# Rotate logs
+count=$(( maxcount - 1))
+debug "Removing $LOG.$count*"
+rm -f -- "$LOG.$count"*
+while (( count > 0 )); do
+  count=$(( count - 1 ))
+  thislogprefix="$LOG.$count"
+  for l in "${thislogprefix}"*; do
+    if [[ -f $l ]]; then
+      thissuffix="${l##${thislogprefix}}"
+      debug "Rotating $l to ${LOG}.$(( count + 1 ))${thissuffix}"
+      mv -- "$l" "${LOG}.$(( count + 1 ))${thissuffix}"
+    fi
+  done
+done
+if [[ -f "$LOG" ]]; then
+  debug "Rotating $LOG to $LOG.0"
+  mv -- "$LOG" "$LOG.0"
+  if [[ -n $compress ]]; then
+    debug "Compressing $LOG.0 using $compress"
+    "$compress" "$LOG.0"
+  fi
+fi
+
+# Open the log and assign a file descriptor
+exec 3<> "$LOG"
+
+# Close the log upon exit
+trap "exec 3>&-" EXIT
+
+# Change the log user, group, and mode if needed
+if [[ -n $mode ]]; then
+  debug "Changing mode of new log to $mode"
+  chmod -- "$mode" "$LOG"
+fi
+if [[ -n $user ]]; then
+  debug "Changing user of new log to $user"
+  chown -- "$user" "$LOG"
+fi
+if [[ -n $group ]]; then
+  debug "Changing group of new log to $group"
+  chgrp -- "$group" "$LOG"
+fi
+
+# Send all lines from stdin to the log
+while read -r LOGLINE; do
+  echo "$LOGLINE" >&3
+done
